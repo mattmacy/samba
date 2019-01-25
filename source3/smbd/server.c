@@ -1,26 +1,4 @@
-/*
-   Unix SMB/CIFS implementation.
-   Main SMB server routines
-   Copyright (C) Andrew Tridgell		1992-1998
-   Copyright (C) Martin Pool			2002
-   Copyright (C) Jelmer Vernooij		2002-2003
-   Copyright (C) Volker Lendecke		1993-2007
-   Copyright (C) Jeremy Allison			1993-2007
-
-   This program is free software; you can redistribute it and/or modify
-   it under the terms of the GNU General Public License as published by
-   the Free Software Foundation; either version 3 of the License, or
-   (at your option) any later version.
-
-   This program is distributed in the hope that it will be useful,
-   but WITHOUT ANY WARRANTY; without even the implied warranty of
-   MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the
-   GNU General Public License for more details.
-
-   You should have received a copy of the GNU General Public License
-   along with this program.  If not, see <http://www.gnu.org/licenses/>.
-*/
-
+#ifndef STANDALONE
 #include "includes.h"
 #include "system/filesys.h"
 #include "lib/util/server_id.h"
@@ -54,7 +32,767 @@
 #include "lib/util/sys_rw.h"
 #include "cleanupdb.h"
 #include "g_lock.h"
+#endif
 
+/*
+ * server_replica.c
+ */
+#include <sys/types.h>
+#include <ctype.h>
+#include <sys/socket.h>
+#include <sys/sysctl.h>
+#include <sys/user.h>
+#include <sys/procctl.h>
+#include <libutil.h>
+#include <signal.h>
+#include <sys/wait.h>
+#include <err.h>
+#include <syslog.h>
+#include <stdarg.h>
+#include <unistd.h>
+
+
+static int ncpus;
+static int rootpid;
+static int num_replicas;
+
+
+#define SINGLE_REPLICA
+#ifdef STANDALONE
+/************** SHIMS ****************************/
+#include <stdio.h>
+#include <stdlib.h> /* abort */
+#include <string.h> /* strerror */
+#include <fcntl.h> /* open */
+
+#define False 0
+#define SIGCLD SIGCHLD
+#define SLEEP(x) sleep(x)
+#define smb_panic(exp)							\
+	do {										\
+		printf(exp);							\
+		abort();								\
+	} while (0)
+
+#define DEBUG(x, exp)							\
+		do {										\
+			printf exp;							\
+			abort();								\
+	} while (0)
+#define DPRINTF printf
+
+struct messaging_context {};
+struct tevent_context {};
+
+
+#define NTSTATUS int
+#define NT_STATUS_OK 0
+#define NT_STATUS_EQUAL(a, b) ((a) == (b))
+#define NT_STATUS_IS_OK(s) ((s) == 0)
+
+#define smbd_process(a, b, c, d) printf("made it to process\n");
+#define exit_server_cleanly(exp)							\
+	do {										\
+		printf(exp);							\
+		exit(0);								\
+	} while (0)
+
+
+static int smbd_replica_fork_request(struct messaging_context *msg_ctx,
+									 struct tevent_context *ev,
+									 int fd_to_send);
+
+static void smbd_replica_shutdown(void);
+
+
+static void smbd_sig_chld_handler(int signum)
+{
+	pid_t pid;
+	int status;
+	int count = 0;
+
+	while ((pid = waitpid(-1, &status, WNOHANG)) > 0) {
+		boolean_t unclean_shutdown = False;
+
+		if (WIFEXITED(status)) {
+			unclean_shutdown = WEXITSTATUS(status);
+		}
+		printf("pid got status for pid: %d -- unclean: %d \n", pid, unclean_shutdown);
+		count++;
+	}
+	printf("got status for %d processes in chld_handler\n", count);
+}
+
+
+/**
+ Catch a signal. This should implement the following semantics:
+
+ 1) The handler remains installed after being called.
+ 2) The signal should be blocked during handler execution.
+**/
+
+static void (*CatchSignal(int signum,void (*handler)(int )))(int)
+{
+#ifdef HAVE_SIGACTION
+	struct sigaction act;
+	struct sigaction oldact;
+
+	ZERO_STRUCT(act);
+
+	act.sa_handler = handler;
+#ifdef SA_RESTART
+	/*
+	 * We *want* SIGALRM to interrupt a system call.
+	 */
+	if(signum != SIGALRM)
+		act.sa_flags = SA_RESTART;
+#endif
+	sigemptyset(&act.sa_mask);
+	sigaddset(&act.sa_mask,signum);
+	sigaction(signum,&act,&oldact);
+	return oldact.sa_handler;
+#else /* !HAVE_SIGACTION */
+	/* FIXME: need to handle sigvec and systems with broken signal() */
+	return signal(signum, handler);
+#endif
+}
+
+int
+main(void)
+{
+	pid_t pid;
+	struct messaging_context m, *msg_ctx;;
+	struct tevent_context t, *ev;
+	int fd;
+
+	msg_ctx = &m;
+	ev = &t;
+	unlink("/tmp/context.txt");
+	fd = open("/tmp/context.txt", O_CREAT|O_RDWR);
+	if (fd == -1) {
+		printf("open failed %s\n", strerror(errno));
+		abort();
+	}
+
+	CatchSignal(SIGCLD, smbd_sig_chld_handler);
+	printf("do fork request\n");
+	pid = smbd_replica_fork_request(msg_ctx, ev, fd);
+	printf("child pid is %d\n", pid);
+	sleep(2);
+	smbd_replica_shutdown();
+	sleep(2);
+	printf("master exiting\n");
+}
+
+#else /* !STANDALONE */
+#include <proto.h> /* smb_panic */
+#define DPRINTF(...)
+#define SLEEP(x)
+#endif
+
+#define my_err(exp) \
+  do {		    \
+  syslog(LOG_EMERG, exp);			\
+  abort();					\
+  } while (0)
+
+
+#define err_sys my_err
+#define err_ret my_err
+#define err_dump my_err
+
+
+/**************************************************/
+
+/* size of control buffer to send/recv one file descriptor */
+#define MAXLINE 128
+
+
+struct replica_state {
+	struct messaging_context *rs_msg_ctx;
+	struct tevent_context *rs_ev;
+
+};
+static int last_replica;
+
+static struct replica_info {
+	int ri_pid;
+	int ri_fd;
+} *replicas;
+
+static int smbd_create_replicas(struct replica_state *rs);
+
+/*
+ * Pass a file descriptor to another process.
+ * If fd<0, then -fd is sent back instead as the error status.
+ */
+static int
+send_fd(int fd, int fd_to_send)
+{
+    struct iovec    iov[1];
+    struct msghdr   msg;
+	union {
+		struct cmsghdr hdr;
+		char buf[1024];
+	} cmsgbuf;
+	struct cmsghdr *cmsg;
+    unsigned int            buf[2]; /* send_fd()/recv_fd() 2-byte protocol */
+
+	DPRINTF("sending fd_to_send %d on fd %d\n", fd_to_send, fd);
+    iov[0].iov_base = buf;
+    iov[0].iov_len  = sizeof(buf);
+	memset(&msg, 0, sizeof(msg));
+    msg.msg_iov     = iov;
+    msg.msg_iovlen  = 1;
+    if (fd_to_send < 0) {
+		DPRINTF("send error on %d - fd_to_send = %d\n", fd, fd_to_send);
+        msg.msg_control    = NULL;
+        msg.msg_controllen = 0;
+        buf[1] = -fd_to_send;   /* nonzero status means error */
+        if (buf[1] == 0)
+            buf[1] = 1; /* -256, etc. would screw up protocol */
+    } else {
+        msg.msg_control    = &cmsgbuf.buf;
+        msg.msg_controllen = CMSG_SPACE(sizeof(int));;
+	cmsg = CMSG_FIRSTHDR(&msg);
+	cmsg->cmsg_len = CMSG_LEN(sizeof(int));
+	cmsg->cmsg_level = SOL_SOCKET;
+	cmsg->cmsg_type = SCM_RIGHTS;
+	*(int *)CMSG_DATA(cmsg) = fd_to_send;
+		msg.msg_controllen = cmsg->cmsg_len;
+        buf[1] = 0;          /* zero status means OK */
+    }
+    buf[0] = 0;              /* null byte flag to recv_fd() */
+    if (sendmsg(fd, &msg, 0) != sizeof(buf))
+        return(-1);
+    return(0);
+}
+
+/*
+ * Receive a file descriptor from a server process.  Also, any data
+ * received is passed to (*userfunc)(STDERR_FILENO, buf, nbytes).
+ * We have a 2-byte protocol for receiving the fd from send_fd().
+ */
+static int
+recv_fd(int fd)
+{
+	int             newfd, nr, status;
+	int           *ptr, val;
+	int            buf[MAXLINE];
+	struct iovec    iov[1];
+	struct msghdr   msg;
+	union {
+		struct cmsghdr hdr;
+		char buf[1024];
+	} cmsgbuf;
+	struct cmsghdr *cmsg;
+
+	status = -1;
+	cmsg = NULL;
+	memset(buf, 0, sizeof(buf));
+	for ( ; ; ) {
+		iov[0].iov_base = buf;
+		iov[0].iov_len  = sizeof(buf);
+		bzero(&msg, sizeof(msg));
+		msg.msg_iov     = iov;
+		msg.msg_iovlen  = 1;
+		msg.msg_control = &cmsgbuf.buf;
+		msg.msg_controllen = CMSG_SPACE(sizeof(int));
+		while ((nr = recvmsg(fd, &msg, 0)) == -1 && errno == EINTR)
+		  usleep(1000);
+
+		if (nr == -1) {
+		  int errno_err = errno;
+
+		  syslog(LOG_EMERG, "recvmsg() failed nr=%d error %s\n", nr, strerror(errno_err));
+		  err_sys("recvmsg error");
+		} else if (nr == 0) {
+			err_sys("connection closed by server\n");
+			return(-1);
+		} else if (nr == -1) {
+			DPRINTF("got recvmsg error %s\n", strerror(errno));
+		}
+		nr = nr >> 2;
+		/*
+		 * See if this is the final data with null & status.  Null
+		 * is next to last byte of buffer; status byte is last byte.
+		 * Zero status means there is a file descriptor to receive.
+		 */
+		for (ptr = buf; ptr < &buf[nr]; ) {
+			val = *ptr;
+			ptr++;
+			if (val == 0) {
+				if (ptr != &buf[nr-1])
+					err_dump("message format error");
+				status = *ptr & 0xFF;  /* prevent sign extension */
+				if (status == 0) {
+					cmsg = CMSG_FIRSTHDR(&msg);
+
+					if (cmsg == NULL)
+						errx(1, "%s: no message header", __func__);
+					if (cmsg->cmsg_type != SCM_RIGHTS)
+						err(1, "%s: expected type %d got %d", __func__,
+							SCM_RIGHTS, cmsg->cmsg_type);
+					if (msg.msg_controllen != CMSG_SPACE(sizeof(int))) {
+						printf("problematic pid=%d\n", getpid());
+						err_dump("status = 0 but no fd\n");
+					}
+					newfd = *(int *)CMSG_DATA(cmsg);
+				} else {
+					newfd = -status;
+				}
+				nr -= 2;
+			} else if (val == INT_MAX) {
+				DPRINTF("exit requested\n");
+				SLEEP(1);
+				exit(0);
+			}
+        }
+		if (nr > 0)
+			return(-1);
+		if (status >= 0)    /* final data has arrived */
+			return(newfd);  /* descriptor, or -status */
+	}
+}
+
+static int
+smbd_replica_fork_request(struct messaging_context *msg_ctx,
+						  struct tevent_context *ev,
+						  int fd_to_send)
+{
+	struct replica_state rs;
+	struct replica_info *ri;
+	int pid;
+	int rc;
+
+	rs.rs_msg_ctx = msg_ctx;
+	rs.rs_ev = ev;
+	if (smbd_create_replicas(&rs))
+		return (-1);
+
+	ri = &replicas[last_replica];
+	/* pass new file descriptor to replica */
+	send_fd(ri->ri_fd, fd_to_send);
+	/* read back child pid */
+	rc = read(ri->ri_fd, &pid, sizeof(pid));
+	if (rc == 0) {
+		DPRINTF("failed to read back pid\n");
+		return (-1);
+	}
+	if (++last_replica == num_replicas)
+		last_replica = 0;
+	if (rc == -1)
+		return (-1);
+	return (pid);
+}
+	
+static int
+smbd_replica_do_fork(struct messaging_context *msg_ctx,
+					 struct tevent_context *ev,
+					 int fd, int newfd)
+{
+	int pid;
+
+	pid = fork();
+	if (pid) {
+		/* The parent doesn't need this socket */
+		close(newfd);
+
+		/* this is the pid of the actual worker */
+		write(fd, (void*)&pid, sizeof(pid));
+
+		return (pid);
+	}
+
+	if (pid == 0) {
+#ifndef STANDALONE
+		NTSTATUS status = NT_STATUS_OK;
+
+		/* Stop zombies, the parent explicitly handles
+		 * them, counting worker smbds. */
+		CatchChild();
+
+		status = smbd_reinit_after_fork(msg_ctx, ev, true, NULL);
+		if (!NT_STATUS_IS_OK(status)) {
+			if (NT_STATUS_EQUAL(status,
+								NT_STATUS_TOO_MANY_OPENED_FILES)) {
+				DEBUG(0,("child process cannot initialize "
+						 "because too many files are open\n"));
+				goto exit;
+			}
+			if (lp_clustering() &&
+			    (NT_STATUS_EQUAL(
+								 status, NT_STATUS_INTERNAL_DB_ERROR) ||
+			     NT_STATUS_EQUAL(
+								 status, NT_STATUS_CONNECTION_REFUSED))) {
+				DEBUG(1, ("child process cannot initialize "
+						  "because connection to CTDB "
+						  "has failed: %s\n",
+						  nt_errstr(status)));
+				goto exit;
+			}
+			DEBUG(0,("reinit_after_fork() failed\n"));
+			smb_panic("reinit_after_fork() failed");
+		}
+#endif
+
+		smbd_process(ev, msg_ctx, newfd, false);
+#ifndef STANDALONE
+	exit:
+#endif
+		exit_server_cleanly("end of child\n");
+		return (0);
+	}
+
+	if (pid < 0) {
+		DEBUG(0,("smbd_accept_connection: fork() failed: %s\n",
+				 strerror(errno)));
+	}
+
+	return (0);
+}
+
+static int
+smbd_replica_fork_handler(struct replica_state *rs, int fd, int newfd)
+{
+	
+	return (smbd_replica_do_fork(rs->rs_msg_ctx, rs->rs_ev, fd, newfd));
+}
+							 
+
+static int
+get_ncpus(void)
+{
+	size_t sizeof_ncpus;
+#ifdef SINGLE_REPLICA
+	return (1);
+#endif
+	if (ncpus != 0)
+		return (ncpus);
+	sizeof_ncpus = sizeof(ncpus);
+	if (sysctlbyname("hw.ncpu", &ncpus, &sizeof_ncpus,
+					 (void *)NULL, 0) == -1)
+		return (-1);
+
+	return (ncpus);
+}
+
+#define STARTDATA "REPLICA START"
+
+static void
+smbd_replica_loop(struct replica_state *rs, int fd)
+{
+	int newfd, rc;
+
+	rc = write(fd, STARTDATA, sizeof(STARTDATA));
+	for ( ; ; ) {
+		newfd = recv_fd(fd);
+		if (newfd == -1)
+			smb_panic("recv_fd failed\n");
+		rc = smbd_replica_fork_handler(rs, fd, newfd);
+		if (rc == -1)
+		   smb_panic("fork handler failed\n");
+	}
+}
+
+static struct kinfo_vmentry *
+smbd_kinfo_getvmmap(pid_t pid, int *cntp, char **bufp)
+{
+	int mib[4];
+	int error;
+	int cnt, pass;
+	size_t len, buflen;
+	char *buf, *bp, *eb;
+	struct kinfo_vmentry *kiv, *kp, *kv;
+
+	*cntp = 0;
+	len = 0;
+	pass = 0;
+	mib[0] = CTL_KERN;
+	mib[1] = KERN_PROC;
+	mib[2] = KERN_PROC_VMMAP;
+	mib[3] = pid;
+
+	error = sysctl(mib, nitems(mib), NULL, &len, NULL, 0);
+	if (error) {
+		return (NULL);
+	}
+	buflen = len * 4 / 3;
+	buf = malloc(len);
+	if (buf == NULL)
+		return (NULL);
+ refetch:
+	len = buflen;
+	error = sysctl(mib, nitems(mib), buf, &len, NULL, 0);
+	if (error) {
+		free(buf);
+		return (NULL);
+	}
+	/* Pass 1: count items */
+	cnt = 0;
+	bp = buf;
+	eb = buf + len;
+	while (bp < eb) {
+		kv = (struct kinfo_vmentry *)(uintptr_t)bp;
+		if (kv->kve_structsize == 0)
+			break;
+		bp += kv->kve_structsize;
+		cnt++;
+	}
+
+	if (pass == 0) {
+		kiv = calloc(2*cnt, sizeof(*kiv));
+		if (kiv == NULL) {
+			printf("calloc fail\n");
+			free(buf);
+			return (NULL);
+		}
+		pass++;
+		goto refetch;
+	}
+
+	bp = buf;
+	eb = buf + len;
+	kp = kiv;
+	/* Pass 2: unpack */
+	while (bp < eb) {
+		kv = (struct kinfo_vmentry *)(uintptr_t)bp;
+		if (kv->kve_structsize == 0)
+			break;
+		/* Copy/expand into pre-zeroed buffer */
+		memcpy(kp, kv, kv->kve_structsize);
+		/* Advance to next packed record */
+		bp += kv->kve_structsize;
+		/* Set field size to fixed length, advance */
+		kp->kve_structsize = sizeof(*kp);
+		kp++;
+	}
+
+	*cntp = cnt;
+	*bufp = buf;
+	return (kiv); /* Caller must free() return value */
+}
+
+
+static int
+privatize_mappings(void)
+{
+	struct kinfo_vmentry *kve;
+	uint8_t *kve_start;
+	uint8_t *va_start, *va_end;
+	char *buf;
+	uint8_t data;
+	int i, count;
+
+	kve = smbd_kinfo_getvmmap(getpid(), &count, &buf);
+	if (kve == NULL) {
+		printf("getvmmap failed\n");
+		return (-1);
+	}
+	if (kve->kve_structsize != sizeof(*kve))
+		DEBUG(0, ("kinfo_vmentry size mismatch - likely ABI breakage, recompile kernel: %d actual %lu, count %d\n",
+				  kve->kve_structsize, sizeof(*kve), count));
+
+	kve_start = (uint8_t *)kve;
+	for (i = 0; i < count; i++) {
+		/* cope with ABI breakage if changes added to the end */
+		kve = (void *)(kve_start + i*kve->kve_structsize);
+		if ((kve->kve_protection & KVME_PROT_WRITE) == 0)
+			continue;
+		//printf("make %#lx-%#lx private\n", kve->kve_start, kve->kve_end);
+		va_start = (uint8_t *)kve->kve_start;
+		va_end = (uint8_t *)kve->kve_end;
+		while (va_start < va_end) {
+			/*
+			 * NB: This needs to use cmpxchg if
+			 * this is multi-threaded
+			 */
+			data = *va_start;
+			/* force CoW fault */
+			*va_start = data;
+			va_start += PAGE_SIZE;
+		}
+	}
+	free(buf);
+	free(kve_start);
+	return (0);
+}
+
+static int
+smbd_replica_child(struct replica_state *rs, int fd)
+{
+
+	if (privatize_mappings())
+		return (-1);
+	/* handle fork requests */
+	smbd_replica_loop(rs, fd);
+	exit(0);
+}
+	
+static int
+smbd_create_replica(struct replica_state *rs, struct replica_info *ri)
+{
+	int sockets[2], rc;
+	char buf[64];
+	pid_t pid;
+
+	rc = socketpair(AF_LOCAL, SOCK_DGRAM, 0, sockets);
+	if (rc == -1) {
+		DPRINTF("socketpair create failed %s\n", strerror(errno));
+		return (rc);
+	}
+	pid = fork();
+	if (pid == -1) {
+		DPRINTF("fork failed\n");
+		close(sockets[0]);
+		close(sockets[1]);
+		return (-1);
+	}
+	if (pid == 0) {
+		close(sockets[0]);
+		if (smbd_replica_child(rs, sockets[1]))
+			return (-1);
+		DPRINTF("should not be reached\n");
+		abort();
+	} else {
+		close(sockets[1]);
+		ri->ri_pid = pid;
+		ri->ri_fd = sockets[0];
+		//printf("doing read in parent -- pid is %d fd is %d ", pid, ri->ri_fd);
+		rc = read(ri->ri_fd, buf, sizeof(buf));
+		//printf("success\n");
+		if (rc == 0) {
+			DPRINTF("got 0 bytes from %d\n", ri->ri_fd);
+			return (-1);
+		}
+
+		if (rc == -1 || strcmp(buf, STARTDATA)) {
+			DPRINTF("bad result on initial read rc: %d buf: %s\n", rc, buf);
+			return (-1);
+		}
+	}
+	return (pid);
+}
+
+static int
+smbd_create_replicas(struct replica_state *rs)
+{
+	int i, count, pid;
+
+	count = get_ncpus();
+	rootpid = getpid();
+
+	DPRINTF("create_replicas - count: %d\n", count);
+	if (num_replicas == count)
+		return (0);
+	if (replicas == NULL)
+		replicas = malloc(sizeof(*replicas)*count);
+	if (replicas == NULL)
+		return (-1);
+	procctl(P_PID, getpid(), PROC_REAP_ACQUIRE, NULL);
+	for (i = 0; i < count; i++) {
+		if ((pid = smbd_create_replica(rs, &replicas[i])) == -1) {
+			DPRINTF("creating replica %d failed\n", i);
+			/* XXX - shutdown replicas */
+			return (-1);
+		}
+		//DPRINTF("replica %d has pid %d fd: %d\n", i, pid, replicas[i].ri_fd);
+		num_replicas++;
+	}
+	return (0);
+}
+
+static void
+smbd_replica_shutdown(void)
+{
+	struct replica_info *ri;
+    struct iovec    iov[1];
+    struct msghdr   msg;
+    unsigned int            buf[2]; /* send_fd()/recv_fd() 2-byte protocol */
+	sigset_t sigs, osigs;
+
+    iov[0].iov_base = buf;
+    iov[0].iov_len  = sizeof(buf);
+    msg.msg_iov     = iov;
+    msg.msg_iovlen  = 1;
+    msg.msg_name    = NULL;
+    msg.msg_namelen = 0;
+	msg.msg_control    = NULL;
+	msg.msg_controllen = 0;
+	buf[0] = INT_MAX;
+	buf[1] = INT_MAX;
+
+	ri = &replicas[0];
+	sigemptyset(&sigs);
+	sigaddset(&sigs, SIGPIPE);
+	sigprocmask(SIG_BLOCK, &sigs, &osigs);
+	for (int i = 0; i < num_replicas; i++, ri++) {
+		DPRINTF("send shutdown to %d on fd %d\n", i, ri->ri_fd);
+		sendmsg(ri->ri_fd, &msg, 0);
+	}
+	DPRINTF("unblocking EPIPE\n");
+	sigprocmask(SIG_SETMASK, &osigs, NULL);
+}
+#ifndef STANDALONE
+/****************************************************************/
+
+/*
+   Unix SMB/CIFS implementation.
+   Main SMB server routines
+   Copyright (C) Andrew Tridgell		1992-1998
+   Copyright (C) Martin Pool			2002
+   Copyright (C) Jelmer Vernooij		2002-2003
+   Copyright (C) Volker Lendecke		1993-2007
+   Copyright (C) Jeremy Allison			1993-2007
+
+   This program is free software; you can redistribute it and/or modify
+   it under the terms of the GNU General Public License as published by
+   the Free Software Foundation; either version 3 of the License, or
+   (at your option) any later version.
+
+   This program is distributed in the hope that it will be useful,
+   but WITHOUT ANY WARRANTY; without even the implied warranty of
+   MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the
+   GNU General Public License for more details.
+
+   You should have received a copy of the GNU General Public License
+   along with this program.  If not, see <http://www.gnu.org/licenses/>.
+*/
+#ifdef notyet
+#include "includes.h"
+#include "system/filesys.h"
+#include "lib/util/server_id.h"
+#include "popt_common.h"
+#include "smbd/smbd.h"
+#include "smbd/globals.h"
+#include "registry/reg_init_full.h"
+#include "libcli/auth/schannel.h"
+#include "secrets.h"
+#include "../lib/util/memcache.h"
+#include "ctdbd_conn.h"
+#include "util_cluster.h"
+#include "printing/queue_process.h"
+#include "rpc_server/rpc_service_setup.h"
+#include "rpc_server/rpc_config.h"
+#include "passdb.h"
+#include "auth.h"
+#include "messages.h"
+#include "messages_ctdb.h"
+#include "smbprofile.h"
+#include "lib/id_cache.h"
+#include "lib/param/param.h"
+#include "lib/background.h"
+#include "lib/conn_tdb.h"
+#include "../lib/util/pidfile.h"
+#include "lib/smbd_shim.h"
+#include "scavenger.h"
+#include "locking/leases_db.h"
+#include "smbd/notifyd/notifyd.h"
+#include "smbd/smbd_cleanupd.h"
+#include "lib/util/sys_rw.h"
+#include "cleanupdb.h"
+#include "g_lock.h"
+#endif
 #ifdef CLUSTER_SUPPORT
 #include "ctdb_protocol.h"
 #endif
@@ -989,55 +1727,7 @@ static void smbd_accept_connection(struct tevent_context *ev,
 		return;
 	}
 
-	pid = fork();
-	if (pid == 0) {
-		NTSTATUS status = NT_STATUS_OK;
-
-		/*
-		 * Can't use TALLOC_FREE here. Nulling out the argument to it
-		 * would overwrite memory we've just freed.
-		 */
-		talloc_free(s->parent);
-		s = NULL;
-
-		/* Stop zombies, the parent explicitly handles
-		 * them, counting worker smbds. */
-		CatchChild();
-
-		status = smbd_reinit_after_fork(msg_ctx, ev, true, NULL);
-		if (!NT_STATUS_IS_OK(status)) {
-			if (NT_STATUS_EQUAL(status,
-					    NT_STATUS_TOO_MANY_OPENED_FILES)) {
-				DEBUG(0,("child process cannot initialize "
-					 "because too many files are open\n"));
-				goto exit;
-			}
-			if (lp_clustering() &&
-			    (NT_STATUS_EQUAL(
-				    status, NT_STATUS_INTERNAL_DB_ERROR) ||
-			     NT_STATUS_EQUAL(
-				    status, NT_STATUS_CONNECTION_REFUSED))) {
-				DEBUG(1, ("child process cannot initialize "
-					  "because connection to CTDB "
-					  "has failed: %s\n",
-					  nt_errstr(status)));
-				goto exit;
-			}
-
-			DEBUG(0,("reinit_after_fork() failed\n"));
-			smb_panic("reinit_after_fork() failed");
-		}
-
-		smbd_process(ev, msg_ctx, fd, false);
-	 exit:
-		exit_server_cleanly("end of child");
-		return;
-	}
-
-	if (pid < 0) {
-		DEBUG(0,("smbd_accept_connection: fork() failed: %s\n",
-			 strerror(errno)));
-	}
+	pid = smbd_replica_fork_request(msg_ctx, ev, fd);
 
 	/* The parent doesn't need this socket */
 	close(fd);
@@ -2156,3 +2846,4 @@ extern void build_options(bool screen);
 	TALLOC_FREE(frame);
 	return(0);
 }
+#endif
