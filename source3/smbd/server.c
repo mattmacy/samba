@@ -649,7 +649,7 @@ privatize_mappings(void)
 	uint8_t *kve_start;
 	uint8_t *va_start, *va_end;
 	char *buf;
-	uint8_t data;
+	uint32_t data;
 	int i, count;
 
 	kve = smbd_kinfo_getvmmap(getpid(), &count, &buf);
@@ -671,13 +671,12 @@ privatize_mappings(void)
 		va_start = (uint8_t *)kve->kve_start;
 		va_end = (uint8_t *)kve->kve_end;
 		while (va_start < va_end) {
+			data = *((uint32_t*)va_start);
 			/*
-			 * NB: This needs to use cmpxchg if
-			 * this is multi-threaded
+			 * We don't need to retry, if the underlying value
+			 * has changed then page has already been CoWed
 			 */
-			data = *va_start;
-			while (atomic_cmpset_int(va_start, data, data) == 0)
-			  data = *va_start;
+			atomic_cmpset_int((uint32_t*)va_start, data, data);
 			va_start += PAGE_SIZE;
 		}
 	}
