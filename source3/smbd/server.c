@@ -67,7 +67,14 @@ static int num_replicas;
 
 #define False 0
 #define SIGCLD SIGCHLD
-#define SLEEP(x) sleep(x)
+#define SLEEP(x)								\
+	do {										\
+	int rem = x;								\
+	while (rem)									\
+		rem = sleep(rem);						\
+	} while (0)
+#define HAVE_SIGACTION
+#define ZERO_STRUCT(x) bzero(&x, sizeof(x))
 #define smb_panic(exp)							\
 	do {										\
 		printf(exp);							\
@@ -157,6 +164,31 @@ static void (*CatchSignal(int signum,void (*handler)(int )))(int)
 #endif
 }
 
+static void sig_cld_leave_status(int signum)
+{
+
+	/*
+	 * Turns out it's *really* important not to
+	 * restore the signal handler here if we have real POSIX
+	 * signal handling. If we do, then we get the signal re-delivered
+	 * immediately - hey presto - instant loop ! JRA.
+	 */
+
+#if !defined(HAVE_SIGACTION)
+	CatchSignal(SIGCLD, sig_cld_leave_status);
+#endif
+}
+
+/****************************************************************************
+catch child exits - leave status;
+****************************************************************************/
+
+static void (*CatchChildLeaveStatus(void))(int)
+{
+	return CatchSignal(SIGCLD, sig_cld_leave_status);
+}
+
+
 int
 main(void)
 {
@@ -177,10 +209,16 @@ main(void)
 	CatchSignal(SIGCLD, smbd_sig_chld_handler);
 	printf("do fork request\n");
 	pid = smbd_replica_fork_request(msg_ctx, ev, fd);
-	printf("child pid is %d\n", pid);
-	sleep(2);
+	printf("child pid1 is %d\n", pid);
+	SLEEP(5);
+	pid = smbd_replica_fork_request(msg_ctx, ev, fd);
+	printf("child pid2 is %d\n", pid);
+	SLEEP(5);
+	pid = smbd_replica_fork_request(msg_ctx, ev, fd);
+	printf("child pid3 is %d\n", pid);
+	SLEEP(5);
 	smbd_replica_shutdown();
-	sleep(2);
+	SLEEP(2);
 	printf("master exiting\n");
 }
 
@@ -305,7 +343,6 @@ recv_fd(int fd)
 		  int errno_err = errno;
 
 		  syslog(LOG_EMERG, "recvmsg() failed nr=%d error %s\n", nr, strerror(errno_err));
-		  err_sys("recvmsg error");
 		} else if (nr == 0) {
 			err_sys("connection closed by server\n");
 			return(-1);
@@ -398,51 +435,59 @@ smbd_replica_do_fork(struct messaging_context *msg_ctx,
 		/* The parent doesn't need this socket */
 		close(newfd);
 
+		/* nothing more for the parent to do */
+		return (0);
+	}
+
+	/*
+	 * Intermediate process
+	 */
+	pid = fork();
+	if (pid) {
 		/* this is the pid of the actual worker */
 		write(fd, (void*)&pid, sizeof(pid));
 
-		return (pid);
+		/* we're just a temporary --- need to orphan */
+		exit(0);
 	}
 
-	if (pid == 0) {
 #ifndef STANDALONE
-		NTSTATUS status = NT_STATUS_OK;
+	NTSTATUS status = NT_STATUS_OK;
 
-		/* Stop zombies, the parent explicitly handles
-		 * them, counting worker smbds. */
-		CatchChild();
+	/* Stop zombies, the parent explicitly handles
+	 * them, counting worker smbds. */
+	CatchChild();
 
-		status = smbd_reinit_after_fork(msg_ctx, ev, true, NULL);
-		if (!NT_STATUS_IS_OK(status)) {
-			if (NT_STATUS_EQUAL(status,
-								NT_STATUS_TOO_MANY_OPENED_FILES)) {
-				DEBUG(0,("child process cannot initialize "
-						 "because too many files are open\n"));
-				goto exit;
-			}
-			if (lp_clustering() &&
-			    (NT_STATUS_EQUAL(
-								 status, NT_STATUS_INTERNAL_DB_ERROR) ||
-			     NT_STATUS_EQUAL(
-								 status, NT_STATUS_CONNECTION_REFUSED))) {
-				DEBUG(1, ("child process cannot initialize "
-						  "because connection to CTDB "
-						  "has failed: %s\n",
-						  nt_errstr(status)));
-				goto exit;
-			}
-			DEBUG(0,("reinit_after_fork() failed\n"));
-			smb_panic("reinit_after_fork() failed");
+	status = smbd_reinit_after_fork(msg_ctx, ev, true, NULL);
+	if (!NT_STATUS_IS_OK(status)) {
+		if (NT_STATUS_EQUAL(status,
+							NT_STATUS_TOO_MANY_OPENED_FILES)) {
+			DEBUG(0,("child process cannot initialize "
+					 "because too many files are open\n"));
+			goto exit;
 		}
+		if (lp_clustering() &&
+			(NT_STATUS_EQUAL(
+							 status, NT_STATUS_INTERNAL_DB_ERROR) ||
+			 NT_STATUS_EQUAL(
+							 status, NT_STATUS_CONNECTION_REFUSED))) {
+			DEBUG(1, ("child process cannot initialize "
+					  "because connection to CTDB "
+					  "has failed: %s\n",
+					  nt_errstr(status)));
+			goto exit;
+		}
+		DEBUG(0,("reinit_after_fork() failed\n"));
+		smb_panic("reinit_after_fork() failed");
+	}
 #endif
 
-		smbd_process(ev, msg_ctx, newfd, false);
+	smbd_process(ev, msg_ctx, newfd, false);
 #ifndef STANDALONE
-	exit:
+ exit:
 #endif
-		exit_server_cleanly("end of child\n");
-		return (0);
-	}
+	exit_server_cleanly("end of child\n");
+	return (0);
 
 	if (pid < 0) {
 		DEBUG(0,("smbd_accept_connection: fork() failed: %s\n",
@@ -484,6 +529,7 @@ smbd_replica_loop(struct replica_state *rs, int fd)
 {
 	int newfd, rc;
 
+	CatchChildLeaveStatus();
 	rc = write(fd, STARTDATA, sizeof(STARTDATA));
 	for ( ; ; ) {
 		newfd = recv_fd(fd);
@@ -573,6 +619,28 @@ smbd_kinfo_getvmmap(pid_t pid, int *cntp, char **bufp)
 	return (kiv); /* Caller must free() return value */
 }
 
+#define MPLOCKED " lock; "
+
+#define ATOMIC_CMPSET(TYPE)                             \
+static __inline int                                     \
+atomic_cmpset_##TYPE(volatile u_##TYPE *dst, u_##TYPE expect, u_##TYPE src) \
+{                                                       \
+        u_char res;                                     \
+                                                        \
+        __asm __volatile(                               \
+        "       " MPLOCKED "            "               \
+        "       cmpxchg %3,%1 ; "                       \
+        "       sete    %0 ;            "               \
+        "# atomic_cmpset_" #TYPE "      "               \
+        : "=q" (res),                   /* 0 */         \
+          "+m" (*dst),                  /* 1 */         \
+          "+a" (expect)                 /* 2 */         \
+        : "r" (src)                     /* 3 */         \
+        : "memory", "cc");                              \
+        return (res);                                   \
+}
+
+ATOMIC_CMPSET(int)
 
 static int
 privatize_mappings(void)
@@ -608,8 +676,8 @@ privatize_mappings(void)
 			 * this is multi-threaded
 			 */
 			data = *va_start;
-			/* force CoW fault */
-			*va_start = data;
+			while (atomic_cmpset_int(va_start, data, data) == 0)
+			  data = *va_start;
 			va_start += PAGE_SIZE;
 		}
 	}
@@ -701,7 +769,7 @@ smbd_create_replicas(struct replica_state *rs)
 	}
 	return (0);
 }
-
+#ifdef STANDALONE 
 static void
 smbd_replica_shutdown(void)
 {
@@ -733,6 +801,7 @@ smbd_replica_shutdown(void)
 	DPRINTF("unblocking EPIPE\n");
 	sigprocmask(SIG_SETMASK, &osigs, NULL);
 }
+#endif
 #ifndef STANDALONE
 /****************************************************************/
 
